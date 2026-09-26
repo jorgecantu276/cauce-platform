@@ -13,8 +13,8 @@ jobs:
     name: SAM infrastructure
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: aws-actions/setup-sam@v2
+      - uses: actions/checkout@v7
+      - uses: aws-actions/setup-sam@v3
       - run: sam validate --lint --template-file services/payments-api/template.yaml
 
   backend-unit:
@@ -24,8 +24,8 @@ jobs:
       run:
         working-directory: services/payments-api
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -40,8 +40,8 @@ jobs:
       run:
         working-directory: services/payments-api
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -53,8 +53,8 @@ jobs:
     name: Frontend workspaces
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -62,4 +62,3 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
-

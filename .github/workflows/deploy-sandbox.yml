@@ -46,17 +46,17 @@ jobs:
       run:
         working-directory: services/payments-api
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - uses: aws-actions/setup-sam@v2
+      - uses: aws-actions/setup-sam@v3
       - name: Validate
         run: sam validate --lint --template-file template.yaml
       - name: Build
         run: sam build --template-file template.yaml
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -90,4 +90,3 @@ jobs:
         env:
           STACK_NAME: ${{ inputs.stack_name }}
         run: aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs" --output table
-
