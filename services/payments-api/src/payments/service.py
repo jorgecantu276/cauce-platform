@@ -9,6 +9,7 @@ from payments.models import (
     MerchantConnection,
     PaymentAssessment,
     PaymentAttempt,
+    PaymentReviewIdentityConflict,
     ProviderCheckout,
     ProviderPayment,
 )
@@ -214,4 +215,24 @@ class PaymentFlow:
             assessment = assess_payment(*context, payment)
         return self.repository.record_payment_observation(
             context, payment, assessment, event_key, self.clock()
+        )
+
+    def reconcile_review_payment(self, event_key, provider_payment_id, review_id, business_id,
+                                 expected_connection_id):
+        """Recheck one reviewed payment using the provider's current facts."""
+        payment = self.provider.get_payment(provider_payment_id)
+        if payment.provider_payment_id != provider_payment_id:
+            raise PaymentReviewIdentityConflict("provider returned a different payment")
+        context = self.repository.payment_context(payment.external_reference)
+        if context is not None and (
+            context[1].id != expected_connection_id
+            or context[0].business_id != business_id
+            or context[1].business_id != business_id
+            or context[2].business_id != business_id
+        ):
+            raise PaymentReviewIdentityConflict("provider payment context belongs to another connection or business")
+        assessment = assess_payment(*context, payment) if context else assess_payment(None, None, None, payment)
+        return self.repository.reassess_payment_review(
+            business_id, review_id, expected_connection_id, context, payment,
+            assessment, event_key, self.clock(),
         )

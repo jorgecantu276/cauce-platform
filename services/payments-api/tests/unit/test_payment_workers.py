@@ -74,6 +74,21 @@ def test_provider_event_worker_claims_and_processes_authoritatively():
     assert runtime.repo.failed == []
 
 
+@pytest.mark.parametrize("signature_valid,source", [(True, "owner_review_retry"), (False, "webhook")])
+def test_provider_event_worker_rejects_non_internal_payment_review_retry(signature_valid, source):
+    runtime = EventRuntime()
+    runtime.repo.claim_provider_events = lambda now, lease_until, limit: [{
+        "id": "event-db-1", "merchant_connection_id": "connection-1",
+        "event_type": "payment_review.retry", "lease_token": "lease-1",
+        "signature_valid": signature_valid, "raw_payload": {"source": source, "reviewId": "review-1"},
+    }]
+    result = run_provider_event_worker(runtime, now=NOW)
+    assert result == {"claimed": 1, "processed": 0, "failed": 0, "review": 1}
+    assert runtime.flow.calls == []
+    assert runtime.repo.failed[0][0][2] == "invalid_internal_retry_event"
+    assert runtime.repo.failed[0][1]["terminal"] is True
+
+
 def test_provider_event_failure_log_is_structured_and_does_not_leak_error_text(caplog):
     runtime = EventRuntime()
     runtime.flow.reconcile_payment = lambda *args, **kwargs: (_ for _ in ()).throw(

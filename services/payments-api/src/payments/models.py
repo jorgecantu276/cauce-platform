@@ -112,3 +112,7 @@ class PaymentAssessment:
     allocate: bool
     review_reason: str | None = None
     allocation_minor: int = 0
+
+
+class PaymentReviewIdentityConflict(Exception):
+    """Authoritative retry evidence conflicts with the reviewed payment's identity."""

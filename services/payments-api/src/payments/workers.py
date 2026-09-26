@@ -5,7 +5,7 @@ import hashlib
 import json
 import logging
 
-from payments.models import CheckoutRequest
+from payments.models import CheckoutRequest, PaymentReviewIdentityConflict
 from payments.service import ProviderOutcomeUnknown
 
 
@@ -44,22 +44,50 @@ def run_provider_event_worker(runtime, *, now=None, limit=25):
     result = {"claimed":len(events),"processed":0,"failed":0,"review":0}
     for event in events:
         try:
-            if event["event_type"] not in ("payment", "reconciliation.payment"):
+            if event["event_type"] not in ("payment", "reconciliation.payment", "payment_review.retry"):
                 repository.fail_provider_event(
                     event["id"],event["lease_token"],"unsupported_event_type",now,terminal=True
                 )
                 result["review"] += 1
                 continue
+            if event["event_type"] == "payment_review.retry" and (
+                event.get("signature_valid") is not False
+                or (event.get("raw_payload") or {}).get("source") != "owner_review_retry"
+            ):
+                repository.fail_provider_event(
+                    event["id"], event["lease_token"], "invalid_internal_retry_event", now, terminal=True
+                )
+                result["review"] += 1
+                continue
             context = runtime.payment_context(str(event["merchant_connection_id"]))
-            assessment = context.flow.reconcile_payment(
-                str(event["provider_event_key"]),
-                str(event["provider_resource_id"]),
-                expected_connection_id=str(event["merchant_connection_id"]),
-            )
+            if event["event_type"] == "payment_review.retry":
+                assessment = context.flow.reconcile_review_payment(
+                    str(event["provider_event_key"]), str(event["provider_resource_id"]),
+                    str(event["raw_payload"]["reviewId"]), str(event["business_id"]),
+                    str(event["merchant_connection_id"]),
+                )
+            else:
+                assessment = context.flow.reconcile_payment(
+                    str(event["provider_event_key"]),
+                    str(event["provider_resource_id"]),
+                    expected_connection_id=str(event["merchant_connection_id"]),
+                )
             if assessment.review_reason:
                 result["review"] += 1
             else:
                 result["processed"] += 1
+        except PaymentReviewIdentityConflict as exc:
+            _log_worker_failure(
+                "provider_event", exc, eventId=event.get("id"),
+                businessId=event.get("business_id"),
+                connectionId=event.get("merchant_connection_id"),
+                attemptCount=event.get("processing_attempt_count"),
+            )
+            repository.fail_provider_event(
+                event["id"], event["lease_token"], "payment_review_identity_conflict",
+                now, terminal=True,
+            )
+            result["review"] += 1
         except Exception as exc:
             _log_worker_failure(
                 "provider_event",exc,eventId=event.get("id"),

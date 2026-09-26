@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sys
+from unittest.mock import patch
 
 import boto3
 from moto import mock_aws
@@ -155,6 +156,335 @@ def _setup_business(repo, business_id, connection_id, membership_id="33333333-33
         "mercadoPago": {"id": connection_id, "providerAccountId": "seller-1", "credentialSecretRef": "arn:credentials", "webhookSecretRef": "arn:webhook"},
     })
     repo.mark_connection_verified(connection_id, NOW)
+
+
+def _reviewed_payment(repo, business_id, connection_id):
+    _setup_business(repo, business_id, connection_id)
+    customer = repo.create_customer(business_id, "Ana", None, "review-retry-customer")
+    created = repo.create_charge(business_id, customer["customerId"], 500, "MXN", "Anticipo",
+                                 date(2026, 9, 20), link_token="review-retry-private-token")
+    checkout = PaymentFlow(repo, Provider(), clock=lambda: NOW).start_checkout(
+        "review-retry-private-token", "review-retry-submission")
+    wrong = ProviderPayment("review-retry-provider-payment", checkout.attempt_id, "seller-1", "test",
+                            499, "MXN", "approved", NOW, approved_at=NOW, provider_updated_at=NOW)
+    context = repo.payment_context(checkout.attempt_id)
+    repo.record_payment_observation(context, wrong, assess_payment(*context, wrong), "review-retry-original", NOW)
+    review = next(item for item in repo.list_reviews(business_id) if item["kind"] == "payment")
+    return created["chargeId"], checkout.attempt_id, review["id"]
+
+
+@mock_aws
+def test_payment_review_retry_fetches_provider_and_allocates_once_when_corrected():
+    business_id, connection_id = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+    repo = DynamoRepository("payments", resource=table(), webhook_connection_id=connection_id)
+    charge_id, attempt_id, payment_id = _reviewed_payment(repo, business_id, connection_id)
+    before = repo.charge_detail(business_id, charge_id)
+    assert before["charge"]["outstandingMinor"] == 500 and before["allocations"] == []
+    operation_key = "review-retry-operation-1"
+    queued = repo.resolve_review(business_id, "payment", payment_id,
+                                 "33333333-3333-4333-8333-333333333333", operation_key,
+                                 "retry", "Consultar el estado actual del proveedor.", NOW)
+    assert queued["outcome"] == "queued"
+    assert repo.resolve_review(business_id, "payment", payment_id,
+                               "33333333-3333-4333-8333-333333333333", operation_key,
+                               "retry", "Consultar el estado actual del proveedor.", NOW) == queued
+    assert len(repo._items(business_id, "EVENT#")) == 1
+    assert len(repo.list_reviews(business_id)) == 1
+    assert repo._items(business_id, "OUTBOX#payment_approved#") == []
+
+    corrected_at = NOW.replace(minute=1)
+    corrected = ProviderPayment("review-retry-provider-payment", attempt_id, "seller-1", "test",
+                                500, "MXN", "approved", corrected_at, approved_at=corrected_at,
+                                provider_updated_at=corrected_at)
+    result = run_provider_event_worker(
+        WorkerRuntime(repo, PaymentFlow(repo, WorkerProvider(corrected), clock=lambda: corrected_at)),
+        now=corrected_at,
+    )
+    assert result == {"claimed": 1, "processed": 1, "failed": 0, "review": 0}
+    detail = repo.charge_detail(business_id, charge_id)
+    assert detail["charge"]["outstandingMinor"] == 0
+    assert detail["charge"]["allocatedMinor"] == 500
+    assert len(detail["payments"]) == len(detail["allocations"]) == 1
+    assert detail["payments"][0]["paymentId"] == detail["allocations"][0]["paymentId"] == payment_id
+    assert detail["payments"][0]["reviewReason"] is None
+    assert detail["providerEvents"][0]["processingStatus"] == "processed"
+    assert repo.list_reviews(business_id) == []
+    assert len(repo._items(business_id, "AUDIT#payment.review_retry#")) == 1
+    assert len([item for item in repo.table.scan()["Items"] if item.get("entity") == "payment_identity"]) == 1
+    notifications = repo._items(business_id, "OUTBOX#payment_approved#")
+    assert len(notifications) == 1
+    assert notifications[0]["SK"] == "OUTBOX#payment_approved#review-retry-provider-payment"
+    assert notifications[0]["status"] == "pending"
+    assert notifications[0]["payload"] == {
+        "paymentId": payment_id, "chargeId": charge_id,
+        "connectionId": connection_id, "environment": "test",
+    }
+    # Replaying the same work after a crash cannot allocate, audit, or queue twice.
+    PaymentFlow(repo, WorkerProvider(corrected), clock=lambda: corrected_at).reconcile_review_payment(
+        f"payment-review-retry:{payment_id}:{operation_key}", corrected.provider_payment_id,
+        payment_id, business_id, connection_id,
+    )
+    assert run_provider_event_worker(
+        WorkerRuntime(repo, PaymentFlow(repo, WorkerProvider(corrected), clock=lambda: corrected_at)),
+        now=corrected_at,
+    )["claimed"] == 0
+    assert len(repo.charge_detail(business_id, charge_id)["allocations"]) == 1
+    assert len(repo._items(business_id, "AUDIT#payment.review_retry#")) == 1
+    assert repo._items(business_id, "OUTBOX#payment_approved#") == notifications
+
+
+@mock_aws
+def test_payment_review_retry_failed_allocation_transaction_queues_no_approval():
+    business_id, connection_id = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+    repo = DynamoRepository("payments", resource=table(), webhook_connection_id=connection_id)
+    charge_id, attempt_id, payment_id = _reviewed_payment(repo, business_id, connection_id)
+    repo.resolve_review(business_id, "payment", payment_id,
+                        "33333333-3333-4333-8333-333333333333", "review-retry-transaction-fails",
+                        "retry", "Volver a consultar al proveedor.", NOW)
+    later = NOW.replace(minute=1)
+    corrected = ProviderPayment("review-retry-provider-payment", attempt_id, "seller-1", "test",
+                                500, "MXN", "approved", later, approved_at=later,
+                                provider_updated_at=later)
+    real_transact = repo.client.transact_write_items
+    attempted_approval = []
+
+    def change_review_before_allocation(**kwargs):
+        if any(write.get("Put", {}).get("Item", {}).get("topic") == "payment_approved"
+               for write in kwargs["TransactItems"]):
+            attempted_approval.append(True)
+            repo.table.update_item(
+                Key={"PK": f"BUSINESS#{business_id}", "SK": f"PAYMENT#{payment_id}"},
+                UpdateExpression="SET updated_at=:newer",
+                ExpressionAttributeValues={":newer": "2026-09-13T15:02:00Z"},
+            )
+        return real_transact(**kwargs)
+
+    with patch.object(repo.client, "transact_write_items", side_effect=change_review_before_allocation):
+        result = run_provider_event_worker(
+            WorkerRuntime(repo, PaymentFlow(repo, WorkerProvider(corrected), clock=lambda: later)),
+            now=later,
+        )
+
+    assert attempted_approval == [True]
+    assert result == {"claimed": 1, "processed": 0, "failed": 1, "review": 0}
+    assert repo._items(business_id, "OUTBOX#payment_approved#") == []
+    assert repo._items(business_id, "AUDIT#payment.review_retry#") == []
+    detail = repo.charge_detail(business_id, charge_id)
+    assert detail["charge"]["outstandingMinor"] == 500
+    assert detail["allocations"] == []
+    assert detail["payments"][0]["reviewReason"] == "amount_mismatch"
+    assert len(repo.list_reviews(business_id)) == 1
+    assert repo._items(business_id, "EVENT#")[0]["processing_status"] == "failed"
+
+
+@mock_aws
+def test_payment_review_retry_keeps_unresolved_mismatch_visible():
+    business_id, connection_id = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+    repo = DynamoRepository("payments", resource=table(), webhook_connection_id=connection_id)
+    charge_id, attempt_id, payment_id = _reviewed_payment(repo, business_id, connection_id)
+    repo.resolve_review(business_id, "payment", payment_id,
+                        "33333333-3333-4333-8333-333333333333", "review-retry-still-wrong",
+                        "retry", "Volver a consultar al proveedor.", NOW)
+    later = NOW.replace(minute=1)
+    still_wrong = ProviderPayment("review-retry-provider-payment", attempt_id, "seller-1", "test",
+                                  499, "MXN", "approved", later, approved_at=NOW, provider_updated_at=later)
+    result = run_provider_event_worker(
+        WorkerRuntime(repo, PaymentFlow(repo, WorkerProvider(still_wrong), clock=lambda: later)), now=later)
+    assert result == {"claimed": 1, "processed": 0, "failed": 0, "review": 1}
+    detail = repo.charge_detail(business_id, charge_id)
+    assert detail["charge"]["outstandingMinor"] == 500
+    assert detail["allocations"] == []
+    assert detail["payments"][0]["paymentId"] == payment_id
+    assert detail["payments"][0]["reviewReason"] == "amount_mismatch"
+    assert detail["providerEvents"][0]["processingStatus"] == "processed"
+    assert [item["kind"] for item in repo.list_reviews(business_id)] == ["payment"]
+
+
+@mock_aws
+def test_payment_review_retry_provider_failure_preserves_review_and_can_retry():
+    business_id, connection_id = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+    repo = DynamoRepository("payments", resource=table(), webhook_connection_id=connection_id)
+    charge_id, attempt_id, payment_id = _reviewed_payment(repo, business_id, connection_id)
+    repo.resolve_review(business_id, "payment", payment_id,
+                        "33333333-3333-4333-8333-333333333333", "review-retry-failed-fetch",
+                        "retry", "Reconsultar con el proveedor.", NOW)
+
+    class FailingProvider(Provider):
+        def get_payment(self, payment_id):
+            raise RuntimeError("provider unavailable")
+
+    failed = run_provider_event_worker(
+        WorkerRuntime(repo, PaymentFlow(repo, FailingProvider(), clock=lambda: NOW)), now=NOW)
+    assert failed == {"claimed": 1, "processed": 0, "failed": 1, "review": 0}
+    assert repo.charge_detail(business_id, charge_id)["allocations"] == []
+    assert len(repo.list_reviews(business_id)) == 1
+    later = NOW.replace(minute=1)
+    corrected = ProviderPayment("review-retry-provider-payment", attempt_id, "seller-1", "test",
+                                500, "MXN", "approved", later, approved_at=later, provider_updated_at=later)
+    recovered = run_provider_event_worker(
+        WorkerRuntime(repo, PaymentFlow(repo, WorkerProvider(corrected), clock=lambda: later)), now=later)
+    assert recovered == {"claimed": 1, "processed": 1, "failed": 0, "review": 0}
+    assert repo.list_reviews(business_id) == []
+    assert len(repo.charge_detail(business_id, charge_id)["allocations"]) == 1
+
+
+@mock_aws
+def test_payment_review_retry_rejects_changed_provider_identity_without_new_payment():
+    business_id, connection_id = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+    repo = DynamoRepository("payments", resource=table(), webhook_connection_id=connection_id)
+    charge_id, attempt_id, payment_id = _reviewed_payment(repo, business_id, connection_id)
+    repo.resolve_review(business_id, "payment", payment_id,
+                        "33333333-3333-4333-8333-333333333333", "review-retry-identity-check",
+                        "retry", "Comprobar identidad del pago.", NOW)
+    later = NOW.replace(minute=1)
+    changed = ProviderPayment("review-retry-provider-payment", attempt_id, "different-seller", "test",
+                              500, "MXN", "approved", later, approved_at=later, provider_updated_at=later)
+    result = run_provider_event_worker(
+        WorkerRuntime(repo, PaymentFlow(repo, WorkerProvider(changed), clock=lambda: later)), now=later)
+    assert result == {"claimed": 1, "processed": 0, "failed": 0, "review": 1}
+    detail = repo.charge_detail(business_id, charge_id)
+    assert len(detail["payments"]) == 1 and detail["payments"][0]["paymentId"] == payment_id
+    assert detail["payments"][0]["reviewReason"] == "amount_mismatch"
+    assert detail["allocations"] == [] and detail["charge"]["outstandingMinor"] == 500
+    assert len([item for item in repo.table.scan()["Items"] if item.get("entity") == "payment_identity"]) == 1
+    assert repo._items(business_id, "OUTBOX#payment_approved#") == []
+    assert repo._items(business_id, "AUDIT#payment.review_retry#") == []
+    event = repo._items(business_id, "EVENT#")[0]
+    assert event["processing_status"] == "review"
+    assert event["processing_error"] == "payment_review_identity_conflict"
+    assert "GSI3PK" not in event
+    assert {item["kind"] for item in repo.list_reviews(business_id)} == {"payment", "provider_event"}
+    assert run_provider_event_worker(
+        WorkerRuntime(repo, PaymentFlow(repo, WorkerProvider(changed), clock=lambda: later)),
+        now=later.replace(minute=10),
+    ) == {"claimed": 0, "processed": 0, "failed": 0, "review": 0}
+
+
+@mock_aws
+def test_payment_review_retry_owner_conflict_is_terminal_without_financial_write():
+    business_id, connection_id = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+    repo = DynamoRepository("payments", resource=table(), webhook_connection_id=connection_id)
+    charge_id, attempt_id, payment_id = _reviewed_payment(repo, business_id, connection_id)
+    repo.resolve_review(business_id, "payment", payment_id,
+                        "33333333-3333-4333-8333-333333333333", "review-retry-owner-conflict",
+                        "retry", "Comprobar la titularidad del pago.", NOW)
+    payment_before = repo._get(business_id, f"PAYMENT#{payment_id}")
+    owner = next(item for item in repo.table.scan()["Items"] if item.get("entity") == "payment_identity")
+    repo.table.update_item(
+        Key={"PK": owner["PK"], "SK": owner["SK"]},
+        UpdateExpression="SET business_id=:other",
+        ExpressionAttributeValues={":other": "44444444-4444-4444-8444-444444444444"},
+    )
+    later = NOW.replace(minute=1)
+    corrected = ProviderPayment("review-retry-provider-payment", attempt_id, "seller-1", "test",
+                                500, "MXN", "approved", later, approved_at=later,
+                                provider_updated_at=later)
+    runtime = WorkerRuntime(repo, PaymentFlow(repo, WorkerProvider(corrected), clock=lambda: later))
+    assert run_provider_event_worker(runtime, now=later) == {
+        "claimed": 1, "processed": 0, "failed": 0, "review": 1,
+    }
+    assert repo._get(business_id, f"PAYMENT#{payment_id}") == payment_before
+    detail = repo.charge_detail(business_id, charge_id)
+    assert detail["charge"]["outstandingMinor"] == 500
+    assert detail["allocations"] == []
+    assert repo._items(business_id, "AUDIT#payment.review_retry#") == []
+    assert repo._items(business_id, "OUTBOX#payment_approved#") == []
+    event = repo._items(business_id, "EVENT#")[0]
+    assert event["processing_status"] == "review"
+    assert event["processing_error"] == "payment_review_identity_conflict"
+    assert "GSI3PK" not in event
+    assert {item["kind"] for item in repo.list_reviews(business_id)} == {"payment", "provider_event"}
+    assert run_provider_event_worker(runtime, now=later.replace(minute=10)) == {
+        "claimed": 0, "processed": 0, "failed": 0, "review": 0,
+    }
+
+
+@mock_aws
+def test_payment_review_retry_keeps_review_if_another_payment_used_the_balance():
+    business_id, connection_id = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+    repo = DynamoRepository("payments", resource=table(), webhook_connection_id=connection_id)
+    charge_id, attempt_id, payment_id = _reviewed_payment(repo, business_id, connection_id)
+    repo.resolve_review(business_id, "payment", payment_id,
+                        "33333333-3333-4333-8333-333333333333", "review-retry-balance-used",
+                        "retry", "Reconsultar antes de asignar.", NOW)
+    later = NOW.replace(minute=1)
+    other = ProviderPayment("different-provider-payment", attempt_id, "seller-1", "test",
+                            500, "MXN", "approved", later, approved_at=later, provider_updated_at=later)
+    context = repo.payment_context(attempt_id)
+    repo.record_payment_observation(context, other, assess_payment(*context, other), "other-payment", later)
+    corrected = ProviderPayment("review-retry-provider-payment", attempt_id, "seller-1", "test",
+                                500, "MXN", "approved", later, approved_at=later, provider_updated_at=later)
+    result = run_provider_event_worker(
+        WorkerRuntime(repo, PaymentFlow(repo, WorkerProvider(corrected), clock=lambda: later)), now=later)
+    assert result == {"claimed": 1, "processed": 0, "failed": 0, "review": 1}
+    detail = repo.charge_detail(business_id, charge_id)
+    assert detail["charge"]["allocatedMinor"] == 500
+    assert detail["charge"]["outstandingMinor"] == 0
+    assert len(detail["allocations"]) == 1
+    assert detail["allocations"][0]["paymentId"] != payment_id
+    assert any(item["id"] == payment_id for item in repo.list_reviews(business_id))
+
+
+@mock_aws
+def test_payment_review_retry_cannot_reopen_a_concurrent_acknowledgment(monkeypatch):
+    business_id, connection_id = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+    repo = DynamoRepository("payments", resource=table(), webhook_connection_id=connection_id)
+    charge_id, attempt_id, payment_id = _reviewed_payment(repo, business_id, connection_id)
+    repo.resolve_review(business_id, "payment", payment_id,
+                        "33333333-3333-4333-8333-333333333333", "review-retry-ack-race",
+                        "retry", "Verificar de nuevo.", NOW)
+    original = repo._apply_existing_payment_snapshot
+
+    def acknowledge_before_snapshot(stored, payment, assessment, now, *, expected_review=None):
+        repo.resolve_review(business_id, "payment", payment_id,
+                            "33333333-3333-4333-8333-333333333333", "review-ack-during-retry",
+                            "acknowledge", "Se revisó la evidencia.", now)
+        return original(stored, payment, assessment, now, expected_review=expected_review)
+
+    monkeypatch.setattr(repo, "_apply_existing_payment_snapshot", acknowledge_before_snapshot)
+    later = NOW.replace(minute=1)
+    still_wrong = ProviderPayment("review-retry-provider-payment", attempt_id, "seller-1", "test",
+                                  499, "MXN", "approved", later, approved_at=NOW, provider_updated_at=later)
+    result = run_provider_event_worker(
+        WorkerRuntime(repo, PaymentFlow(repo, WorkerProvider(still_wrong), clock=lambda: later)), now=later)
+    assert result["failed"] == 1
+    assert repo.list_reviews(business_id) == []
+    assert repo.charge_detail(business_id, charge_id)["allocations"] == []
+
+
+@mock_aws
+def test_payment_review_retry_does_not_allocate_after_a_recorded_adjustment():
+    business_id, connection_id = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+    repo = DynamoRepository("payments", resource=table(), webhook_connection_id=connection_id)
+    charge_id, attempt_id, payment_id = _reviewed_payment(repo, business_id, connection_id)
+    adjustment_at = NOW.replace(minute=1)
+    adjusted = ProviderPayment(
+        "review-retry-provider-payment", attempt_id, "seller-1", "test", 499, "MXN", "approved",
+        adjustment_at, approved_at=NOW, provider_updated_at=adjustment_at,
+        adjustments=(ProviderAdjustment("review-retry-refund", "refund", 499, "approved", adjustment_at),),
+    )
+    context = repo.payment_context(attempt_id)
+    repo.record_payment_observation(context, adjusted, assess_payment(*context, adjusted),
+                                    "review-retry-adjustment", adjustment_at)
+    assert len([item for item in repo._items(business_id, "ADJUSTMENT#")
+                if item["payment_id"] == payment_id]) == 1
+    repo.resolve_review(business_id, "payment", payment_id,
+                        "33333333-3333-4333-8333-333333333333", "review-retry-stored-adjustment",
+                        "retry", "Verificar el ajuste del proveedor.", adjustment_at)
+    later = NOW.replace(minute=2)
+    response_without_adjustment = ProviderPayment(
+        "review-retry-provider-payment", attempt_id, "seller-1", "test", 500, "MXN", "approved",
+        later, approved_at=later, provider_updated_at=later,
+    )
+    result = run_provider_event_worker(
+        WorkerRuntime(repo, PaymentFlow(repo, WorkerProvider(response_without_adjustment), clock=lambda: later)),
+        now=later,
+    )
+    assert result == {"claimed": 1, "processed": 0, "failed": 0, "review": 1}
+    detail = repo.charge_detail(business_id, charge_id)
+    assert detail["allocations"] == []
+    assert detail["charge"]["outstandingMinor"] == 500
+    assert detail["payments"][0]["reviewReason"] == "amount_mismatch"
 
 
 @mock_aws

@@ -200,7 +200,9 @@ export const fixtureApi: StaffApi = {
   requestRefund: async (_businessId, paymentId) => delay({ refundId: `fixture-refund-${crypto.randomUUID()}`, amountMinor: 0, status: "requested", paymentId }),
   listReviews: async () => delay({ items: [...reviews], hasMore: false }),
   resolveReview: async (_businessId, item, input) => {
-    reviews = reviews.filter((review) => !(review.kind === item.kind && review.id === item.id));
+    if (input.action === "acknowledge" || item.kind !== "payment") {
+      reviews = reviews.filter((review) => !(review.kind === item.kind && review.id === item.id));
+    }
     return delay({ kind: item.kind, reviewId: item.id, action: input.action, outcome: input.action === "retry" ? "queued" : "acknowledged" });
   },
   getWorkQueue: async () => delay<WorkItem[]>([

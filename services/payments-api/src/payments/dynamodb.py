@@ -19,7 +19,7 @@ from botocore.exceptions import ClientError
 
 from payments import imports as imports_module
 from payments.imports import ImportIdempotencyConflict, ImportOperationRefused
-from payments.models import Charge, MerchantConnection, MerchantRuntimeConfig, PaymentAttempt
+from payments.models import Charge, MerchantConnection, MerchantRuntimeConfig, PaymentAttempt, PaymentReviewIdentityConflict
 
 
 def _uuid():
@@ -758,7 +758,7 @@ class DynamoRepository:
             self._set_event(self.webhook_connection_id, event_key, "review", now, review_reason)
         return replace(assessment, allocate=False, review_reason=review_reason, allocation_minor=0)
 
-    def _apply_existing_payment_snapshot(self, stored, payment, assessment, now):
+    def _apply_existing_payment_snapshot(self, stored, payment, assessment, now, *, expected_review=None):
         """Apply a later provider snapshot without duplicating its payment.
 
         A refund/reversal is an immutable adjustment and a compensating
@@ -809,6 +809,12 @@ class DynamoRepository:
         # *this* call's own assessment happens to be clean.
         stored_review_reason = stored.get("review_reason")
         writes = [{"Update": {"TableName": self.table_name, "Key": {"PK": stored["PK"], "SK": stored["SK"]}, "UpdateExpression": "SET provider_status=:status, provider_observed_at=:observed, provider_updated_at=:updated, provider_live_mode=:live, review_reason=:review, updated_at=:now", "ExpressionAttributeValues": {":status": payment.status, ":observed": _iso(payment.observed_at), ":updated": _iso(payment.provider_updated_at), ":live": payment.provider_live_mode, ":review": assessment.review_reason or stored_review_reason, ":now": _iso(now)}}}]
+        if expected_review is not None:
+            update = writes[0]["Update"]
+            update["ConditionExpression"] = "review_reason=:expected_review AND updated_at=:expected_updated"
+            update["ExpressionAttributeValues"].update(
+                {":expected_review": expected_review, ":expected_updated": stored["updated_at"]}
+            )
         for adjustment in adjustment_specs:
             key = hashlib.sha256(str(adjustment.provider_adjustment_id).encode()).hexdigest()
             sk = f"ADJUSTMENT#{stored['id']}#{key}"
@@ -928,6 +934,110 @@ class DynamoRepository:
             if self._conditional(error):
                 raise RuntimeError("payment adjustment conflicted with a newer balance") from error
             raise
+
+    def reassess_payment_review(self, business_id, review_id, connection_id, context,
+                                payment, assessment, event_key, now):
+        """Apply an owner's queued provider recheck without minting another payment."""
+        stored = self._get(business_id, f"PAYMENT#{review_id}")
+        if not stored:
+            raise ValueError("reviewed payment not found for connection")
+        if stored["merchant_connection_id"] != connection_id:
+            raise PaymentReviewIdentityConflict("reviewed payment belongs to another connection")
+        if (stored["provider_payment_id"] != payment.provider_payment_id
+                or stored["provider_account_id"] != payment.provider_account_id
+                or stored["environment"] != payment.environment):
+            raise PaymentReviewIdentityConflict("provider payment identity changed during review retry")
+        identity = hashlib.sha256(
+            f"mercado_pago\n{stored['environment']}\n{stored['provider_account_id']}\n{stored['provider_payment_id']}".encode()
+        ).hexdigest()
+        owner_key = {"PK": f"PAYMENT_IDENTITY#{identity}", "SK": "OWNER"}
+        owner = self.table.get_item(Key=owner_key, ConsistentRead=True).get("Item")
+        if not owner or owner.get("business_id") != business_id or owner.get("payment_id") != review_id:
+            raise PaymentReviewIdentityConflict("reviewed payment identity owner is missing or changed")
+        review_reason = stored.get("review_reason")
+        if not review_reason:
+            self._set_event(connection_id, event_key, "processed", now)
+            return replace(assessment, allocate=False, review_reason=None, allocation_minor=0)
+        incoming_at = _iso(payment.provider_updated_at or payment.observed_at)
+        stored_at = stored.get("provider_updated_at") or stored.get("provider_observed_at")
+        if stored_at and incoming_at < stored_at:
+            self._set_event(connection_id, event_key, "processed", now)
+            return replace(assessment, allocate=False, review_reason=review_reason, allocation_minor=0)
+        allocations = [item for item in self._items(business_id, "ALLOCATION#") if item["payment_id"] == review_id]
+        stored_adjustments = [item for item in self._items(business_id, "ADJUSTMENT#")
+                              if item["payment_id"] == review_id]
+        can_allocate = (
+            assessment.allocate and context is not None and not allocations
+            and not payment.adjustments and not stored_adjustments
+            and review_reason != "adjustment_effective_reversed"
+            and stored.get("payment_attempt_id") in (None, context[0].id)
+            and stored.get("charge_id") in (None, context[2].id)
+        )
+        charge = self._get(business_id, f"CHARGE#{context[2].id}") if can_allocate else None
+        amount = int(payment.amount_minor)
+        if not charge or charge.get("cancelled_at") or int(charge["outstanding_minor"]) < amount:
+            self._apply_existing_payment_snapshot(stored, payment, assessment, now,
+                                                  expected_review=review_reason)
+            self._set_event(connection_id, event_key, "processed", now)
+            return replace(assessment, allocate=False, review_reason=review_reason, allocation_minor=0)
+
+        pk = _business_key(business_id)
+        allocation_id = _uuid()
+        allocation = {"PK": pk, "SK": f"ALLOCATION#{allocation_id}", "entity": "allocation",
+                      "id": allocation_id, "business_id": business_id, "payment_id": review_id,
+                      "charge_id": charge["id"], "amount_minor": amount, "created_at": _iso(now)}
+        audit = {"PK": pk, "SK": f"AUDIT#payment.review_retry#{hashlib.sha256(event_key.encode()).hexdigest()}",
+                 "entity": "audit", "id": _uuid(), "business_id": business_id,
+                 "action": "payment.review_retry_allocated", "aggregate_id": review_id,
+                 "operation_key": event_key, "actor_id": connection_id, "occurred_at": _iso(now),
+                 "details": {"previousReviewReason": review_reason, "allocationMinor": amount}}
+        outbox_id = _uuid()
+        outbox = {"PK": pk, "SK": f"OUTBOX#payment_approved#{payment.provider_payment_id}",
+                  "entity": "outbox", "id": outbox_id, "business_id": business_id,
+                  "topic": "payment_approved", "operation_key": payment.provider_payment_id,
+                  "payload": {"paymentId": review_id, "chargeId": charge["id"],
+                              "connectionId": connection_id, "environment": payment.environment},
+                  "status": "pending", "available_at": _iso(now), "attempt_count": 0,
+                  "GSI1PK": f"OUTBOX#{outbox_id}", "GSI1SK": "OUTBOX",
+                  "GSI3PK": "WORK#outbox", "GSI3SK": f"{_iso(now)}#{review_id}"}
+        try:
+            self.client.transact_write_items(TransactItems=[
+                {"ConditionCheck": {"TableName": self.table_name, "Key": owner_key,
+                                    "ConditionExpression": "business_id=:business AND payment_id=:payment",
+                                    "ExpressionAttributeValues": {":business": business_id, ":payment": review_id}}},
+                {"Update": {"TableName": self.table_name,
+                            "Key": {"PK": stored["PK"], "SK": stored["SK"]},
+                            "UpdateExpression": "SET provider_status=:status, amount_minor=:amount, currency=:currency, approved_at=:approved, provider_observed_at=:observed, provider_updated_at=:provider_updated, provider_live_mode=:live, payment_attempt_id=:attempt, charge_id=:charge, updated_at=:now REMOVE review_reason, review_retry_requested_at",
+                            "ConditionExpression": "review_reason=:review AND updated_at=:previous",
+                            "ExpressionAttributeValues": {":status": payment.status, ":amount": amount,
+                                                          ":currency": payment.currency, ":approved": _iso(payment.approved_at),
+                                                          ":observed": _iso(payment.observed_at),
+                                                          ":provider_updated": _iso(payment.provider_updated_at),
+                                                          ":live": payment.provider_live_mode, ":now": _iso(now),
+                                                          ":attempt": context[0].id, ":charge": charge["id"],
+                                                          ":review": review_reason, ":previous": stored["updated_at"]}}},
+                {"Update": {"TableName": self.table_name, "Key": {"PK": pk, "SK": charge["SK"]},
+                            "UpdateExpression": "SET allocated_minor=allocated_minor + :amount, outstanding_minor=outstanding_minor - :amount",
+                            "ConditionExpression": "outstanding_minor=:outstanding AND attribute_not_exists(cancelled_at)",
+                            "ExpressionAttributeValues": {":amount": amount,
+                                                          ":outstanding": int(charge["outstanding_minor"])}}},
+                {"Put": {"TableName": self.table_name, "Item": self._marshal(allocation),
+                         "ConditionExpression": "attribute_not_exists(PK)"}},
+                {"Put": {"TableName": self.table_name, "Item": self._marshal(audit),
+                         "ConditionExpression": "attribute_not_exists(PK)"}},
+                {"Put": {"TableName": self.table_name, "Item": self._marshal(outbox),
+                         "ConditionExpression": "attribute_not_exists(PK)"}},
+            ])
+        except ClientError as error:
+            if not self._conditional(error):
+                raise
+            current = self._get(business_id, f"PAYMENT#{review_id}")
+            if current and not current.get("review_reason"):
+                self._set_event(connection_id, event_key, "processed", now)
+                return replace(assessment, allocate=False, review_reason=None, allocation_minor=0)
+            raise RuntimeError("payment review retry conflicted with newer payment or balance state") from error
+        self._set_event(connection_id, event_key, "processed", now)
+        return replace(assessment, review_reason=None, allocation_minor=amount)
 
     def list_reviews(self, business_id, limit=100):
         return self.review_page(business_id, limit)["items"]
@@ -1081,6 +1191,11 @@ class DynamoRepository:
         resolution_sk = f"REVIEW_RESOLUTION#{operation_key}"
         existing = self._get(business_id, resolution_sk)
         if existing:
+            if review_kind == "payment" and action == "retry" and (
+                existing["review_kind"] != review_kind or existing["review_id"] != str(review_id)
+                or existing["action"] != action
+            ):
+                raise ValueError("review idempotency key was used for another action")
             return {"kind": review_kind, "reviewId": str(review_id), "action": action, "outcome": existing["outcome"]}
         entity = {"payment": "payment", "refund": "refund", "provider_event": "provider_event"}[review_kind]
         target = self._by_id(entity, review_id)
@@ -1121,7 +1236,41 @@ class DynamoRepository:
         if names:
             update_args["ExpressionAttributeNames"] = names
         resolution = {"PK": _business_key(business_id), "SK": resolution_sk, "entity": "review_resolution", "id": _uuid(), "business_id": business_id, "review_kind": review_kind, "review_id": str(review_id), "action": action, "note": note, "resolved_by_membership_id": membership_id, "operation_key": operation_key, "outcome": outcome, "created_at": _iso(now)}
-        if review_kind == "refund" and action == "acknowledge":
+        if review_kind == "payment" and action == "retry":
+            # Queue an authoritative provider fetch in the same commit as the
+            # owner's resolution record. A timestamp alone is not claimable.
+            event_key = f"payment-review-retry:{review_id}:{operation_key}"
+            event_id, value = _uuid(), _iso(now)
+            event = {"PK": _business_key(business_id),
+                     "SK": self._event_sk(target["merchant_connection_id"], event_key),
+                     "entity": "provider_event", "id": event_id, "business_id": business_id,
+                     "merchant_connection_id": target["merchant_connection_id"],
+                     "provider": target["provider"], "environment": target["environment"],
+                     "provider_event_key": event_key, "provider_resource_id": target["provider_payment_id"],
+                     "event_type": "payment_review.retry", "signature_valid": False,
+                     "raw_payload": {"source": "owner_review_retry", "reviewId": str(review_id)},
+                     "received_at": value, "processing_status": "accepted", "available_at": value,
+                     "GSI1PK": f"EVENT#{event_id}", "GSI1SK": "EVENT",
+                     "GSI3PK": "WORK#provider_event", "GSI3SK": f"{value}#{event_id}"}
+            try:
+                self.client.transact_write_items(TransactItems=[
+                    {"Update": {"TableName": self.table_name, **update_args,
+                                "ConditionExpression": "review_reason=:review AND updated_at=:previous",
+                                "ExpressionAttributeValues": {**values, ":review": target["review_reason"],
+                                                              ":previous": target["updated_at"]}}},
+                    {"Put": {"TableName": self.table_name, "Item": self._marshal(event),
+                             "ConditionExpression": "attribute_not_exists(PK)"}},
+                    {"Put": {"TableName": self.table_name, "Item": self._marshal(resolution),
+                             "ConditionExpression": "attribute_not_exists(PK)"}},
+                ])
+            except ClientError as error:
+                if not self._conditional(error):
+                    raise
+                existing = self._get(business_id, resolution_sk)
+                if existing and existing["review_kind"] == review_kind and existing["review_id"] == str(review_id) and existing["action"] == action:
+                    return {"kind": review_kind, "reviewId": str(review_id), "action": action, "outcome": existing["outcome"]}
+                raise RuntimeError("payment review retry conflicted with a newer resolution") from error
+        elif review_kind == "refund" and action == "acknowledge":
             # Terminal (status -> "resolved"): release the payment's
             # REFUND_LOCK in the same transaction as the acknowledgement, so
             # a fresh refund request becomes possible again in the same
