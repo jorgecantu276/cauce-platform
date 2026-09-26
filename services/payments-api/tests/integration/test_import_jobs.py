@@ -50,7 +50,7 @@ def manifest(business_id):
     return {
         "business": {"id": business_id, "displayName": "Cobranza Norte", "folioPrefix": "CN", "branding": {}},
         "memberships": [],
-        "mercadoPago": {"id": "connection-1", "providerAccountId": "seller-1", "credentialSecretRef": "arn:credentials", "webhookSecretRef": "arn:webhook"},
+        "mercadoPago": {"id": f"connection-{business_id[:4]}", "providerAccountId": "seller-1", "credentialSecretRef": "arn:credentials", "webhookSecretRef": "arn:webhook"},
     }
 
 

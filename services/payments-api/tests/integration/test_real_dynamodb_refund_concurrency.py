@@ -29,8 +29,8 @@ at DynamoDB Local instead of real AWS, if a local daemon is preferred over a
 deployed sandbox table for this check.
 
 Run this manually after a real sandbox deploy, not as part of routine
-verification. It creates and deletes its own rows, isolated under a random
-business_id per run, and cleans them up in a `finally` block -- but it is
+verification. It creates and deletes its own rows under a random business_id
+and connection_id per run, and cleans them up in a `finally` block -- but it is
 still real read/write traffic against a real table, so treat it accordingly.
 """
 
@@ -41,6 +41,7 @@ import sys
 import uuid
 
 import boto3
+from botocore.exceptions import ClientError
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
@@ -81,16 +82,27 @@ def _repository():
     return DynamoRepository(REAL_TABLE_NAME, resource=resource)
 
 
-def _delete_all_items_for_business(repo, business_id):
+def _delete_all_items_for_business(repo, business_id, connection_id):
     """Best-effort cleanup: this table is real and possibly shared with
     other real data, so this test must never leave rows behind, pass or
-    fail. Deletes every item under this run's own randomly-generated
-    business_id partition only -- never touches anything else."""
+    fail. Deletes this run's business partition and its connection identity
+    only when that identity still belongs to this business."""
     pk = f"BUSINESS#{business_id}"
-    response = repo.table.query(KeyConditionExpression="PK = :pk", ExpressionAttributeValues={":pk": pk})
-    with repo.table.batch_writer() as batch:
-        for item in response.get("Items", []):
-            batch.delete_item(Key={"PK": item["PK"], "SK": item["SK"]})
+    try:
+        response = repo.table.query(KeyConditionExpression="PK = :pk", ExpressionAttributeValues={":pk": pk})
+        with repo.table.batch_writer() as batch:
+            for item in response.get("Items", []):
+                batch.delete_item(Key={"PK": item["PK"], "SK": item["SK"]})
+    finally:
+        try:
+            repo.table.delete_item(
+                Key={"PK": f"CONNECTION_IDENTITY#{connection_id}", "SK": "OWNER"},
+                ConditionExpression="business_id = :business_id",
+                ExpressionAttributeValues={":business_id": business_id},
+            )
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise
     # PAYMENT_IDENTITY#... owner rows live under their own hashed PK, not the
     # business partition -- find them via the payments just deleted above by
     # re-deriving nothing (they hold no reverse pointer), so this is the one
@@ -154,4 +166,4 @@ def test_real_dynamodb_two_different_refund_keys_racing_the_same_payment_only_on
         assert len(detail["refundOperations"]) == 1
         assert detail["refundOperations"][0]["refundId"] == successes[0]["refundId"]
     finally:
-        _delete_all_items_for_business(repo, business_id)
+        _delete_all_items_for_business(repo, business_id, connection_id)

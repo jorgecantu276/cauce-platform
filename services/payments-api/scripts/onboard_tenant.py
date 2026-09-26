@@ -7,6 +7,7 @@ verification step must establish that state before checkout can start.
 
 import argparse
 import json
+import os
 import re
 import sys
 import uuid
@@ -61,7 +62,10 @@ def manifest_from(path):
             fail(f"mercadoPago.{field} is required")
     if not memberships:
         fail("at least one owner membership is required")
+    if len(memberships) > 97:
+        fail("memberships must contain at most 97 entries")
     normalized_memberships = []
+    subjects = set()
     owners = 0
     for item in memberships:
         if not isinstance(item, dict):
@@ -70,6 +74,9 @@ def manifest_from(path):
         role = item.get("role")
         if not subject or len(subject) > 512 or role not in ("owner", "staff"):
             fail("each membership needs subjectId and role owner or staff")
+        if subject in subjects:
+            fail("memberships must have distinct subjectId values")
+        subjects.add(subject)
         owners += role == "owner"
         normalized_memberships.append({"id": str(uuid.uuid4()), "subjectId": subject, "role": role})
     if not owners:

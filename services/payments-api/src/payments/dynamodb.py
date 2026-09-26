@@ -203,18 +203,21 @@ class DynamoRepository:
         return self.table.put_item(**options)
 
     def put_tenant_manifest(self, manifest):
-        """Idempotently provision validated onboarding data without secrets."""
+        """Provision a new tenant atomically; never rewrite an existing one."""
         business = manifest["business"]
         connection = manifest["mercadoPago"]
+        subjects = [str(membership["subjectId"]).strip() for membership in manifest["memberships"]]
+        if len(subjects) != len(set(subjects)):
+            raise ValueError("memberships must have distinct subjectId values")
         now = _iso(datetime.now(timezone.utc))
         pk = _business_key(business["id"])
-        self.table.put_item(Item={
+        items = [{
             "PK": pk, "SK": "BUSINESS", "entity": "business", "id": business["id"],
             "business_id": business["id"], "display_name": business["displayName"],
             "folio_prefix": business["folioPrefix"], "branding": business["branding"], "updated_at": now,
-        })
+        }]
         for membership in manifest["memberships"]:
-            self.table.put_item(Item={
+            items.append({
                 "PK": pk, "SK": f"MEMBERSHIP#{membership['id']}", "entity": "membership",
                 "id": membership["id"], "business_id": business["id"], "subject_id": membership["subjectId"],
                 "role": membership["role"], "revoked_at": None, "GSI2PK": f"SUBJECT#{membership['subjectId']}",
@@ -229,7 +232,25 @@ class DynamoRepository:
             "verified_at": None, "disabled_at": None, "GSI1PK": f"CONNECTION#{connection['id']}",
             "GSI1SK": "CONNECTION", "updated_at": now,
         }
-        self.table.put_item(Item=connection_item)
+        items.append(connection_item)
+        items.append({
+            "PK": f"CONNECTION_IDENTITY#{connection['id']}", "SK": "OWNER",
+            "entity": "connection_identity", "connection_id": connection["id"],
+            "business_id": business["id"],
+        })
+        if len(items) > 100:
+            raise ValueError("tenant manifest exceeds the 100-item transaction limit")
+        writes = [
+            {"Put": {"TableName": self.table_name, "Item": self._marshal(item),
+                     "ConditionExpression": "attribute_not_exists(PK)"}}
+            for item in items
+        ]
+        try:
+            self.client.transact_write_items(TransactItems=writes)
+        except ClientError as error:
+            if self._conditional(error):
+                raise ValueError("tenant already exists or onboarding items conflict") from error
+            raise
 
     def membership(self, business_id, subject_id, roles=("owner", "staff")):
         for value in self._items(business_id, "MEMBERSHIP#"):
