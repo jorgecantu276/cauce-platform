@@ -2041,5 +2041,14 @@ class DynamoRepository:
         return {"business_name": (business or {}).get("display_name"), "folio": charge["folio"], "description": charge["description"], "currency": charge["currency"], "outstanding_minor": int(charge["outstanding_minor"]), "customer_name": (customer or {}).get("display_name"), "email": (customer or {}).get("email")}
 
     def operational_health(self, now):
-        values = self.table.scan().get("Items", [])
-        return {"providerEvents": sum(item.get("entity") == "provider_event" and item.get("processing_status") in ("accepted", "failed", "review") for item in values), "outbox": sum(item.get("entity") == "outbox" and item.get("status") in ("pending", "failed") for item in values), "refunds": sum(item.get("entity") == "refund" and item.get("status") == "review" for item in values)}
+        health = {"providerEvents": 0, "outbox": 0, "refunds": 0}
+        scan = {}
+        while True:
+            page = self.table.scan(**scan)
+            values = page.get("Items", [])
+            health["providerEvents"] += sum(item.get("entity") == "provider_event" and item.get("processing_status") in ("accepted", "failed", "review") for item in values)
+            health["outbox"] += sum(item.get("entity") == "outbox" and item.get("status") in ("pending", "failed") for item in values)
+            health["refunds"] += sum(item.get("entity") == "refund" and item.get("status") == "review" for item in values)
+            if not page.get("LastEvaluatedKey"):
+                return health
+            scan = {"ExclusiveStartKey": page["LastEvaluatedKey"]}

@@ -1,6 +1,7 @@
 from datetime import date, datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import call, patch
 import os
 import sys
 
@@ -13,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
 from payments.dynamodb import DynamoRepository
 from payments.models import PaymentAssessment, ProviderAdjustment, ProviderCheckout, ProviderPayment
 from payments.service import assess_payment
+from payments.workers import run_operational_health
 
 
 NOW = datetime(2026, 9, 13, 15, 0, tzinfo=timezone.utc)
@@ -1382,3 +1384,32 @@ def test_mark_attempt_ready_fails_promptly_with_exactly_one_read_when_genuinely_
         with pytest.raises(RuntimeError, match="different preference"):
             repo.mark_attempt_ready(BUSINESS_ID, "11111111-1111-4111-8111-111111111111", checkout, NOW)
     assert len(reads) == 1
+
+
+@mock_aws
+def test_operational_health_counts_later_scan_page_and_worker_fails_closed():
+    repo = DynamoRepository("payments", resource=resource())
+    cursor = {"PK": "BUSINESS#first", "SK": "OUTBOX#last-on-first-page"}
+    first_page = {
+        "Items": [
+            {"entity": "provider_event", "processing_status": "processed"},
+            {"entity": "outbox", "status": "sent"},
+            {"entity": "refund", "status": "completed"},
+        ],
+        "LastEvaluatedKey": cursor,
+    }
+    second_page = {
+        "Items": [
+            {"entity": "provider_event", "processing_status": "failed"},
+            {"entity": "outbox", "status": "pending"},
+            {"entity": "refund", "status": "review"},
+        ],
+    }
+    with patch.object(repo.table, "scan", side_effect=[first_page, second_page, first_page, second_page]) as scan:
+        assert repo.operational_health(NOW) == {"providerEvents": 1, "outbox": 1, "refunds": 1}
+        with pytest.raises(RuntimeError, match="health check failed"):
+            run_operational_health(SimpleNamespace(repository=lambda: repo), now=NOW)
+    assert scan.call_args_list == [
+        call(), call(ExclusiveStartKey=cursor),
+        call(), call(ExclusiveStartKey=cursor),
+    ]
