@@ -1,0 +1,7 @@
+/* Semantic visual tokens. A host may override these safely through theme.ts. */
+:root { --nav-alt: #172545; }
+.side-nav { background: linear-gradient(155deg, var(--nav), var(--nav-alt) 57%, var(--nav)); }
+.summary-card:first-child { border-color: var(--nav-alt); background: linear-gradient(125deg, var(--nav-alt), var(--nav)); }
+.review-note { display: grid; gap: 6px; width: 100%; color: var(--muted); font-size: .75rem; font-weight: 700; }
+.review-note textarea { min-height: 72px; resize: vertical; border: 1px solid #d1d3d1; border-radius: 10px; padding: 9px 11px; background: #fff; color: var(--ink); font: inherit; }
+.review-note textarea:focus { border-color: #ed866f; outline: 2px solid #ffe0d6; outline-offset: 1px; }

@@ -1,0 +1,1 @@
+"""Public payment HTTP entrypoint."""

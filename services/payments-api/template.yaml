@@ -1,0 +1,635 @@
+﻿AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Multi-tenant payment platform backend
+
+Parameters:
+  ProviderSecretsArnPattern:
+    Type: String
+    Description: Scoped Secrets Manager ARN/pattern for sandbox merchant credentials.
+  ApplicationSecretArn:
+    Type: String
+    Description: Secrets Manager ARN containing link_token_hmac.
+  NotificationFromEmail:
+    Type: String
+    Description: Verified SES sender for transactional payment email.
+  StaffAuthIssuer:
+    Type: String
+    Description: HTTPS issuer for staff JWTs.
+  StaffAuthAudience:
+    Type: String
+    Description: Audience for staff JWTs.
+  StaffAllowedOrigin:
+    Type: String
+    Description: Exact HTTPS origin allowed to call staff APIs.
+  PlatformAdminGroup:
+    Type: String
+    Default: cauce-super-admin
+    Description: Exact verified JWT group allowed to open the platform implementation console.
+  AlarmTopicArn:
+    Type: String
+    Description: SNS topic ARN for payment-processing operator alerts.
+  ImportRowsRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: >-
+      Days the temporary ETL row chunks (customer names/emails/amounts)
+      live before DynamoDB TTL removes them. 30 is a sandbox pilot setting,
+      not a legal or compliance decision; review it before any real data.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 10
+    MemorySize: 256
+    Architectures: [arm64]
+    Environment:
+      Variables:
+        PAYMENTS_TABLE_NAME: !Ref PaymentsTable
+
+Resources:
+  PaymentsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+        - AttributeName: GSI2PK
+          AttributeType: S
+        - AttributeName: GSI2SK
+          AttributeType: S
+        - AttributeName: GSI3PK
+          AttributeType: S
+        - AttributeName: GSI3SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: LookupIndex
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection: {ProjectionType: ALL}
+        - IndexName: SubjectIndex
+          KeySchema:
+            - AttributeName: GSI2PK
+              KeyType: HASH
+            - AttributeName: GSI2SK
+              KeyType: RANGE
+          Projection: {ProjectionType: ALL}
+        - IndexName: WorkIndex
+          KeySchema:
+            - AttributeName: GSI3PK
+              KeyType: HASH
+            - AttributeName: GSI3SK
+              KeyType: RANGE
+          Projection: {ProjectionType: ALL}
+      # Only the temporary ETL row chunks (IMPORT_ROWS#*) carry a `ttl`
+      # attribute; every other item type has none and never expires.
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      TableClass: STANDARD
+  Api:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: v1
+      DefaultRouteSettings:
+        # Part D: cheap, unconditional rate limiting on every route this
+        # API serves — a blunt but real defense against abusive traffic
+        # hitting payment-create/mp-webhook before anything more
+        # sophisticated (WAF) is justified by actual volume.
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 25
+      CorsConfiguration:
+        AllowOrigins: [!Ref StaffAllowedOrigin]
+        AllowHeaders: [Authorization, Content-Type, Idempotency-Key]
+        AllowMethods: [GET, POST, OPTIONS]
+      Auth:
+        Authorizers:
+          StaffJwtAuthorizer:
+            IdentitySource: "$request.header.Authorization"
+            JwtConfiguration:
+              issuer: !Ref StaffAuthIssuer
+              audience: [!Ref StaffAuthAudience]
+
+  HealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: health.app.handler
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /health
+            Method: GET
+
+  PublicPaymentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: public_payment.app.handler
+      Policies:
+        - Statement:
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:UpdateItem
+              - dynamodb:TransactWriteItems
+            Resource:
+              - !GetAtt PaymentsTable.Arn
+              - !Sub "${PaymentsTable.Arn}/index/*"
+        - Statement:
+            Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref ProviderSecretsArnPattern
+      Events:
+        ReadCharge:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /pay/{token}
+            Method: GET
+        StartCheckout:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /pay/{token}/attempts
+            Method: POST
+
+  MercadoPagoWebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: mp_webhook.app.handler
+      Timeout: 20
+      Policies:
+        - Statement:
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:Query
+              - dynamodb:UpdateItem
+            Resource:
+              - !GetAtt PaymentsTable.Arn
+              - !Sub "${PaymentsTable.Arn}/index/*"
+        - Statement:
+            Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref ProviderSecretsArnPattern
+      Events:
+        MercadoPagoWebhook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /webhooks/mercado-pago/{connectionId}
+            Method: POST
+
+  StaffApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: staff_api.app.handler
+      Environment:
+        Variables:
+          APPLICATION_SECRET_ARN: !Ref ApplicationSecretArn
+          PLATFORM_ADMIN_GROUP: !Ref PlatformAdminGroup
+          IMPORT_ROWS_RETENTION_DAYS: !Ref ImportRowsRetentionDays
+      Policies:
+        - Statement:
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:Query
+              - dynamodb:UpdateItem
+              # Purge deletes ETL rows/guards/metadata with Delete operations
+              # inside TransactWriteItems, which IAM authorizes as DeleteItem.
+              - dynamodb:DeleteItem
+              - dynamodb:TransactWriteItems
+            Resource:
+              - !GetAtt PaymentsTable.Arn
+              - !Sub "${PaymentsTable.Arn}/index/*"
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref ApplicationSecretArn
+      Events:
+        CreateCustomer:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /businesses/{businessId}/customers
+            Method: POST
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        CreateCharge:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /businesses/{businessId}/charges
+            Method: POST
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        ListCustomers:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /businesses/{businessId}/customers
+            Method: GET
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        ListCharges:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /businesses/{businessId}/charges
+            Method: GET
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        BusinessSummary:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /businesses/{businessId}/summary
+            Method: GET
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        ChargeDetail:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /businesses/{businessId}/charges/{chargeId}
+            Method: GET
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        WorkQueue:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /businesses/{businessId}/work-queue
+            Method: GET
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        MerchantConnection:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /businesses/{businessId}/merchant-connection
+            Method: GET
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        BusinessBranding:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /businesses/{businessId}/branding
+            Method: GET
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        StaffSession:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /session
+            Method: GET
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        CancelCharge:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /businesses/{businessId}/charges/{chargeId}/cancel
+            Method: POST
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        RequestRefund:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /businesses/{businessId}/payments/{paymentId}/refunds
+            Method: POST
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        ListReviews:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /businesses/{businessId}/reviews
+            Method: GET
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        ResolveReview:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /businesses/{businessId}/reviews/{reviewKind}/{reviewId}/resolve
+            Method: POST
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        # Platform (superadmin) routes below. The JWT authorizer only proves
+        # who the caller is; PLATFORM_ADMIN_GROUP (env, above) is what
+        # platform_transport.py checks server-side before any of these do
+        # real work -- see payments/platform_auth.py. Reuses this same
+        # function rather than a dedicated Lambda: platform_transport.py is
+        # already a fully separate module/trust boundary in code, so a
+        # second Lambda would only add fixed cost, not real isolation.
+        ValidateImport:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /platform/businesses/{businessId}/imports/validate
+            Method: POST
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        GetImport:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /platform/businesses/{businessId}/imports/{importId}
+            Method: GET
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        ListImports:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /platform/businesses/{businessId}/imports
+            Method: GET
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        ApplyImport:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /platform/businesses/{businessId}/imports/{importId}/apply
+            Method: POST
+            Auth: {Authorizer: StaffJwtAuthorizer}
+        PurgeImport:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /platform/businesses/{businessId}/imports/{importId}/purge
+            Method: POST
+            Auth: {Authorizer: StaffJwtAuthorizer}
+
+  ProviderEventWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: provider_event_worker.app.handler
+      Timeout: 60
+      Policies:
+        - Statement:
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:UpdateItem
+              - dynamodb:TransactWriteItems
+            Resource:
+              - !GetAtt PaymentsTable.Arn
+              - !Sub "${PaymentsTable.Arn}/index/*"
+        - Statement:
+            Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref ProviderSecretsArnPattern
+      Events:
+        WorkSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+
+  ReconciliationWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: reconciliation_worker.app.handler
+      Timeout: 120
+      Policies:
+        - Statement:
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:Query
+              - dynamodb:UpdateItem
+              - dynamodb:TransactWriteItems
+            Resource:
+              - !GetAtt PaymentsTable.Arn
+              - !Sub "${PaymentsTable.Arn}/index/*"
+        - Statement:
+            Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref ProviderSecretsArnPattern
+      Events:
+        ReconciliationSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+
+  RefundWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: refund_worker.app.handler
+      Timeout: 120
+      Policies:
+        - Statement:
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:Query
+              - dynamodb:UpdateItem
+              - dynamodb:TransactWriteItems
+            Resource:
+              - !GetAtt PaymentsTable.Arn
+              - !Sub "${PaymentsTable.Arn}/index/*"
+        - Statement:
+            Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref ProviderSecretsArnPattern
+      Events:
+        RefundSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+
+  OutboxWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: outbox_worker.app.handler
+      Timeout: 60
+      Environment:
+        Variables:
+          NOTIFICATION_FROM_EMAIL: !Ref NotificationFromEmail
+      Policies:
+        - Statement:
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:UpdateItem
+            Resource:
+              - !GetAtt PaymentsTable.Arn
+              - !Sub "${PaymentsTable.Arn}/index/*"
+        - Statement:
+            Effect: Allow
+            Action: ses:SendEmail
+            # Scoped to the one verified sender identity this stack is
+            # configured with -- never every identity in the account.
+            Resource: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${NotificationFromEmail}"
+      Events:
+        OutboxSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+
+  OperationalHealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: operational_health.app.handler
+      Timeout: 30
+      Policies:
+        # Read-only and exact: this function only scans the base table to
+        # report a health summary; it cannot read individual records or write.
+        - Statement:
+            Effect: Allow
+            Action: dynamodb:Scan
+            Resource: !GetAtt PaymentsTable.Arn
+      Events:
+        HealthSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+
+  ProviderEventWorkerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Provider event worker invocation failed.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProviderEventWorkerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicArn]
+
+  ReconciliationWorkerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scheduled provider reconciliation failed.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ReconciliationWorkerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicArn]
+
+  RefundWorkerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Refund worker invocation failed.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RefundWorkerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicArn]
+
+  OutboxWorkerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Customer notification worker invocation failed.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OutboxWorkerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicArn]
+
+  PaymentProcessingHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Payment work is stalled or requires operator review.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OperationalHealthFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicArn]
+
+  # Without an explicit log group, Lambda auto-creates one with no retention
+  # ("Never expire") the first time each function runs. These own the same
+  # /aws/lambda/<function> name so CloudFormation manages retention instead;
+  # they carry no DeletionPolicy, so removing the stack removes them with it
+  # -- unlike the payments table, log retention is not meant to outlive a
+  # torn-down pilot stack. 30 days is a starting point for the sandbox pilot,
+  # not a compliance-driven number; revisit it before handling real payments.
+  HealthFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${HealthFunction}", RetentionInDays: 30}
+  PublicPaymentFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${PublicPaymentFunction}", RetentionInDays: 30}
+  MercadoPagoWebhookFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${MercadoPagoWebhookFunction}", RetentionInDays: 30}
+  StaffApiFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${StaffApiFunction}", RetentionInDays: 30}
+  ProviderEventWorkerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${ProviderEventWorkerFunction}", RetentionInDays: 30}
+  ReconciliationWorkerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${ReconciliationWorkerFunction}", RetentionInDays: 30}
+  RefundWorkerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${RefundWorkerFunction}", RetentionInDays: 30}
+  OutboxWorkerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${OutboxWorkerFunction}", RetentionInDays: 30}
+  OperationalHealthFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${OperationalHealthFunction}", RetentionInDays: 30}
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/v1"

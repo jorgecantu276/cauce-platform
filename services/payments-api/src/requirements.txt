@@ -1,0 +1,7 @@
+mercadopago==3.6.0
+# Bundled explicitly rather than relying on the version AWS bakes into the
+# managed python3.12 runtime: that version changes on AWS's own schedule, not
+# ours, so pinning it here keeps what CI tests (via moto's own boto3
+# dependency) the same as what actually ships to Lambda. Pure Python/no
+# native extensions, so this is arm64-safe with no container build required.
+boto3==1.43.18

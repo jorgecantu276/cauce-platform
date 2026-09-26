@@ -1,0 +1,93 @@
+name: Deploy sandbox
+
+# Manual only. A push or merge never creates or changes AWS resources.
+on:
+  workflow_dispatch:
+    inputs:
+      stack_name:
+        description: CloudFormation stack name
+        required: true
+        default: cauce-sandbox
+        type: string
+      staff_allowed_origin:
+        description: Exact HTTPS origin shared by the authenticated web applications
+        required: true
+        type: string
+      staff_auth_issuer:
+        description: OIDC issuer URL for staff JWTs
+        required: true
+        type: string
+      staff_auth_audience:
+        description: OIDC audience/client ID for staff JWTs
+        required: true
+        type: string
+      notification_from_email:
+        description: SES-verified sender address
+        required: true
+        type: string
+      alarm_topic_arn:
+        description: SNS topic ARN for operator alerts
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: sandbox-deploy-${{ inputs.stack_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy sandbox backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/payments-api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: aws-actions/setup-sam@v2
+      - name: Validate
+        run: sam validate --lint --template-file template.yaml
+      - name: Build
+        run: sam build --template-file template.yaml
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Deploy
+        env:
+          STACK_NAME: ${{ inputs.stack_name }}
+          STAFF_ALLOWED_ORIGIN: ${{ inputs.staff_allowed_origin }}
+          STAFF_AUTH_ISSUER: ${{ inputs.staff_auth_issuer }}
+          STAFF_AUTH_AUDIENCE: ${{ inputs.staff_auth_audience }}
+          NOTIFICATION_FROM_EMAIL: ${{ inputs.notification_from_email }}
+          ALARM_TOPIC_ARN: ${{ inputs.alarm_topic_arn }}
+          PROVIDER_SECRETS_ARN_PATTERN: ${{ secrets.PROVIDER_SECRETS_ARN_PATTERN }}
+          APPLICATION_SECRET_ARN: ${{ secrets.APPLICATION_SECRET_ARN }}
+        run: >-
+          sam deploy
+          --stack-name "$STACK_NAME"
+          --resolve-s3
+          --s3-prefix "$STACK_NAME"
+          --capabilities CAPABILITY_IAM
+          --no-fail-on-empty-changeset
+          --no-confirm-changeset
+          --parameter-overrides
+          ProviderSecretsArnPattern="$PROVIDER_SECRETS_ARN_PATTERN"
+          ApplicationSecretArn="$APPLICATION_SECRET_ARN"
+          NotificationFromEmail="$NOTIFICATION_FROM_EMAIL"
+          StaffAuthIssuer="$STAFF_AUTH_ISSUER"
+          StaffAuthAudience="$STAFF_AUTH_AUDIENCE"
+          StaffAllowedOrigin="$STAFF_ALLOWED_ORIGIN"
+          AlarmTopicArn="$ALARM_TOPIC_ARN"
+      - name: Stack outputs
+        env:
+          STACK_NAME: ${{ inputs.stack_name }}
+        run: aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs" --output table
+
